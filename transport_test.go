@@ -392,3 +392,27 @@ func TestTransportHighSequenceNumbers(t *testing.T) {
 		t.Fatalf("diff = %q, want %q", diff, "high seq test")
 	}
 }
+
+func TestTransportKeepsStillReferenceableOldStatesBeyond128(t *testing.T) {
+	server, client := newTestPair(t)
+
+	// Without client acknowledgements, every server diff remains based on state 0.
+	// The receiver must therefore retain state 0 until the server advances
+	// throwawayNum; an arbitrary history cap would make later diffs unrecoverable.
+	for i := 1; i <= 140; i++ {
+		server.SetPending([]byte{byte(i)})
+		datagrams := server.Tick()
+		if len(datagrams) == 0 {
+			t.Fatalf("state %d: no datagrams", i)
+		}
+		var got []byte
+		for _, dg := range datagrams {
+			if diff := client.Recv(dg); diff != nil {
+				got = diff
+			}
+		}
+		if len(got) != 1 || got[0] != byte(i) {
+			t.Fatalf("state %d: diff=%v; state 0 was likely evicted", i, got)
+		}
+	}
+}

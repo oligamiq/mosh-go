@@ -18,28 +18,29 @@ import (
 // The caller provides state diffs (server: terminal output, client: keystrokes)
 // and receives remote state updates.
 type Transport struct {
-	mu sync.Mutex
+	mu     sync.Mutex
+	recvMu sync.Mutex
 
-	ocb       *OCB
-	toRemote  uint64 // direction bit for outgoing (dirToServer or dirToClient)
-	toLocal   uint64 // direction bit for incoming
+	ocb      *OCB
+	toRemote uint64 // direction bit for outgoing (dirToServer or dirToClient)
+	toLocal  uint64 // direction bit for incoming
 
 	// Outgoing state (SSP §3).
-	sentNum      uint64 // newest state we've sent (new_num)
-	ackedByRemote uint64 // newest state the remote has acknowledged
+	sentNum        uint64 // newest state we've sent (new_num)
+	ackedByRemote  uint64 // newest state the remote has acknowledged
 	pendingDiff    []byte // diff payload waiting to be sent
 	diffSent       bool   // true = pendingDiff has been sent at least once
 	diffOldNum     uint64 // locked oldNum for all diffs until base advances
 	hasPendingBase bool   // true = diffOldNum is locked
 	pendingDataAck bool   // true = send ack ASAP (received data, not just ack)
 
-	// Incoming state — list of received state nums for old_num validation.
-	receivedNums   []uint64 // ordered list of state nums we have
-	ackNum         uint64   // latest received state num
-	sentAckNum     uint64   // last ackNum we actually sent on wire
-	throwawayNum   uint64   // oldest state we still hold
-	lastRecvOldNum uint64   // oldNum from most recently received diff
-	lastRecvNewNum uint64   // newNum from most recently received diff
+	// Incoming state — received state nums retained until the remote advances throwawayNum.
+	receivedNums   map[uint64]struct{}
+	ackNum         uint64 // latest received state num
+	sentAckNum     uint64 // last ackNum we actually sent on wire
+	throwawayNum   uint64 // oldest state we still hold
+	lastRecvOldNum uint64 // oldNum from most recently received diff
+	lastRecvNewNum uint64 // newNum from most recently received diff
 
 	// Sequence counter for the crypto layer (independent of SSP state numbering).
 	seqOut      uint64
@@ -82,7 +83,7 @@ func NewTransport(ocb *OCB, isServer bool) *Transport {
 		rto:          initialRTO,
 		lastSend:     time.Now(),
 		lastRecv:     time.Now(),
-		receivedNums: []uint64{0}, // start with state 0
+		receivedNums: map[uint64]struct{}{0: {}}, // start with state 0
 	}
 	if isServer {
 		t.toRemote = dirToClient
@@ -203,6 +204,54 @@ func (t *Transport) Tick() [][]byte {
 // Recv processes an incoming wire datagram.
 // Returns the diff payload if a complete message was reassembled, or nil.
 func (t *Transport) Recv(wire []byte) []byte {
+	t.recvMu.Lock()
+	defer t.recvMu.Unlock()
+	return t.recv(wire)
+}
+
+// RecvAuthenticated is Recv plus an authentication result for the datagram.
+// authenticated is true once OCB authentication succeeds for a fresh packet,
+// including heartbeats and incomplete fragments that do not yield a diff yet.
+func (t *Transport) RecvAuthenticated(wire []byte) (diff []byte, authenticated bool) {
+	t.recvMu.Lock()
+	defer t.recvMu.Unlock()
+
+	t.mu.Lock()
+	previousSeq, previousSeqSet := t.seqInMax, t.seqInMaxSet
+	t.mu.Unlock()
+
+	diff = t.recv(wire)
+
+	t.mu.Lock()
+	authenticated = t.seqInMaxSet && (!previousSeqSet || t.seqInMax != previousSeq)
+	t.mu.Unlock()
+	return
+}
+
+// RecvState processes one datagram and atomically returns the SSP state metadata
+// associated with the accepted diff. accepted is false for replays, fragments,
+// invalid datagrams, and diffs whose old_num is unknown. Empty diffs may still
+// be accepted state transitions and therefore return accepted=true.
+func (t *Transport) RecvState(wire []byte) (diff []byte, oldNum, newNum, throwawayNum uint64, accepted bool) {
+	t.recvMu.Lock()
+	defer t.recvMu.Unlock()
+
+	t.mu.Lock()
+	previousNewNum := t.lastRecvNewNum
+	t.mu.Unlock()
+
+	diff = t.recv(wire)
+
+	t.mu.Lock()
+	oldNum = t.lastRecvOldNum
+	newNum = t.lastRecvNewNum
+	throwawayNum = t.throwawayNum
+	t.mu.Unlock()
+	accepted = newNum != previousNewNum
+	return
+}
+
+func (t *Transport) recv(wire []byte) []byte {
 	if len(wire) < minDatagram {
 		return nil
 	}
@@ -302,34 +351,25 @@ func (t *Transport) Recv(wire []byte) []byte {
 	}
 
 	// Check if we already have new_num (dedup).
-	for _, n := range t.receivedNums {
-		if n == ti.NewNum {
-			return nil
-		}
-	}
-
-	// Check if we have old_num (required to apply diff).
-	hasOld := false
-	for _, n := range t.receivedNums {
-		if n == ti.OldNum {
-			hasOld = true
-			break
-		}
-	}
-	if !hasOld {
+	if _, ok := t.receivedNums[ti.NewNum]; ok {
 		return nil
 	}
 
-	// Process throwaway.
+	// Check if we have old_num (required to apply diff).
+	if _, ok := t.receivedNums[ti.OldNum]; !ok {
+		return nil
+	}
+
+	// Process throwaway. SSP permits the remote to reference any received state
+	// at or above this floor, so do not evict still-referenceable states using
+	// an arbitrary history cap.
 	if ti.ThrowawayNum > t.throwawayNum {
 		t.throwawayNum = ti.ThrowawayNum
-		filtered := t.receivedNums[:0]
-		for _, n := range t.receivedNums {
-			if n >= t.throwawayNum {
-				filtered = append(filtered, n)
+		for n := range t.receivedNums {
+			if n < t.throwawayNum {
+				delete(t.receivedNums, n)
 			}
 		}
-		t.receivedNums = filtered
 	}
 
 	// Track oldNum/newNum for state management.
@@ -337,12 +377,7 @@ func (t *Transport) Recv(wire []byte) []byte {
 	t.lastRecvNewNum = ti.NewNum
 
 	// Add new state.
-	t.receivedNums = append(t.receivedNums, ti.NewNum)
-
-	// Bound the list.
-	if len(t.receivedNums) > 128 {
-		t.receivedNums = t.receivedNums[1:]
-	}
+	t.receivedNums[ti.NewNum] = struct{}{}
 
 	// Update ack num to latest received state.
 	t.ackNum = ti.NewNum
@@ -496,8 +531,9 @@ func zlibDecompress(data []byte) []byte {
 		return nil
 	}
 	defer r.Close()
-	out, err := io.ReadAll(io.LimitReader(r, 1<<20))
-	if err != nil {
+	const maxDecompressed = 1 << 20
+	out, err := io.ReadAll(io.LimitReader(r, maxDecompressed+1))
+	if err != nil || len(out) > maxDecompressed {
 		return nil
 	}
 	return out

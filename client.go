@@ -20,6 +20,7 @@ type Client struct {
 	output               []byte // accumulated terminal output
 	outputC              chan struct{}
 	terminalPresentation bool
+	recvState            *recvStateTracker
 
 	// Action tracking for cumulative diffs.
 	actionsMu        sync.Mutex
@@ -68,8 +69,25 @@ func dial(host string, port int, key string, terminalPresentation bool) (*Client
 }
 
 // DialConn creates a mosh client over an existing datagram connection.
-// Use this with WebTransport or other non-UDP transports.
+// Use this with WebTransport or other non-UDP transports. Raw clients retain
+// the historical Hoststring byte-stream behavior without terminal recovery.
 func DialConn(conn Conn, ocb *OCB) (*Client, error) {
+	return dialConn(conn, ocb, false)
+}
+
+// DialConnTerminal is DialConn plus the local-terminal presentation envelope
+// and SSP display-state recovery used by the upstream mosh frontend. This is
+// intended for embedded terminal emulators such as TailSSH's Termux TerminalView.
+func DialConnTerminal(conn Conn, ocb *OCB) (*Client, error) {
+	c, err := dialConn(conn, ocb, true)
+	if err != nil {
+		return nil, err
+	}
+	c.EnableXTermTerminalPresentation()
+	return c, nil
+}
+
+func dialConn(conn Conn, ocb *OCB, terminalRecovery bool) (*Client, error) {
 	c := &Client{
 		conn:             conn,
 		transport:        NewTransport(ocb, false),
@@ -77,6 +95,9 @@ func DialConn(conn Conn, ocb *OCB) (*Client, error) {
 		outputC:          make(chan struct{}, 1),
 		done:             make(chan struct{}),
 		sentActionCounts: make(map[uint64]int),
+	}
+	if terminalRecovery {
+		c.recvState = newRecvStateTracker(80, 24)
 	}
 
 	c.wg.Add(2)
@@ -87,18 +108,6 @@ func DialConn(conn Conn, ocb *OCB) (*Client, error) {
 	c.transport.ForceNextSend()
 	c.tick()
 
-	return c, nil
-}
-
-// DialConnTerminal is DialConn plus the local-terminal presentation envelope
-// used by the upstream mosh frontend. This is intended for embedded terminal
-// emulators such as TailSSH's Termux TerminalView.
-func DialConnTerminal(conn Conn, ocb *OCB) (*Client, error) {
-	c, err := DialConn(conn, ocb)
-	if err != nil {
-		return nil, err
-	}
-	c.EnableXTermTerminalPresentation()
 	return c, nil
 }
 
@@ -194,6 +203,9 @@ func (c *Client) Send(keys []byte) {
 
 // Resize sends a resize to the server.
 func (c *Client) Resize(cols, rows uint16) {
+	if c.recvState != nil {
+		c.recvState.resize(int(cols), int(rows))
+	}
 	c.actionsMu.Lock()
 	c.actions = append(c.actions, UserInstruction{Width: int32(cols), Height: int32(rows)})
 	c.dirty = true
@@ -203,30 +215,31 @@ func (c *Client) Resize(cols, rows uint16) {
 // Recv reads accumulated terminal output, blocking until output is available
 // or the timeout expires. Returns nil on timeout.
 func (c *Client) Recv(timeout time.Duration) []byte {
-	// Check if output is already available.
-	c.mu.Lock()
-	if len(c.output) > 0 {
-		out := c.output
-		c.output = nil
+	timer := time.NewTimer(timeout)
+	defer timer.Stop()
+
+	for {
+		c.mu.Lock()
+		if len(c.output) > 0 {
+			out := c.output
+			c.output = nil
+			c.mu.Unlock()
+			return out
+		}
 		c.mu.Unlock()
-		return out
-	}
-	c.mu.Unlock()
 
-	// Wait for output or timeout.
-	select {
-	case <-c.outputC:
-	case <-time.After(timeout):
-		return nil
-	case <-c.done:
-		return nil
+		// outputC is only a wake-up hint. A buffered notification may be stale
+		// if an earlier Recv consumed output before consuming the signal, so
+		// always loop and re-check the actual output buffer.
+		select {
+		case <-c.outputC:
+			continue
+		case <-timer.C:
+			return nil
+		case <-c.done:
+			return nil
+		}
 	}
-
-	c.mu.Lock()
-	out := c.output
-	c.output = nil
-	c.mu.Unlock()
-	return out
 }
 
 // Close shuts down the client.
@@ -317,19 +330,22 @@ func (c *Client) recvLoop() {
 		data := make([]byte, n)
 		copy(data, buf[:n])
 
-		diff := c.transport.Recv(data)
-		if diff == nil {
-			continue
-		}
-
-		instrs, err := UnmarshalHostMessage(diff)
-		if err != nil || len(instrs) == 0 {
+		diff, oldNum, newNum, throwawayNum, accepted := c.transport.RecvState(data)
+		if !accepted {
 			continue
 		}
 
 		var output []byte
-		for _, hi := range instrs {
-			output = append(output, hi.Hoststring...)
+		if c.recvState != nil {
+			output = c.recvState.apply(diff, oldNum, newNum, throwawayNum)
+		} else {
+			instrs, err := UnmarshalHostMessage(diff)
+			if err != nil {
+				continue
+			}
+			for _, hi := range instrs {
+				output = append(output, hi.Hoststring...)
+			}
 		}
 		if len(output) == 0 {
 			continue

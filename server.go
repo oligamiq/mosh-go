@@ -526,12 +526,13 @@ func (s *Server) recvUDP(out chan<- UserInstruction) {
 		data := make([]byte, n)
 		copy(data, buf[:n])
 
-		// Feed to transport — only update clientAddr on successful decrypt.
-		diff := s.transport.Recv(data)
-
-		s.mu.Lock()
-		s.clientAddr = addr
-		s.mu.Unlock()
+		// Feed to transport — only authenticated packets may move clientAddr.
+		diff, authenticated := s.transport.RecvAuthenticated(data)
+		if authenticated {
+			s.mu.Lock()
+			s.clientAddr = addr
+			s.mu.Unlock()
+		}
 
 		if diff == nil {
 			continue

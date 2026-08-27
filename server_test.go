@@ -760,3 +760,68 @@ func TestServeRWResize(t *testing.T) {
 	}
 	t.Log("ServeRW resize callback fired correctly")
 }
+
+func TestServerClientAddrMovesOnlyAfterAuthenticatedPacket(t *testing.T) {
+	srv, err := NewServer("", 0, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer srv.Close()
+
+	out := make(chan UserInstruction, 1)
+	go srv.recvUDP(out)
+
+	serverAddr := &net.UDPAddr{IP: net.ParseIP("127.0.0.1"), Port: srv.Port()}
+	legit, err := net.DialUDP("udp4", nil, serverAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer legit.Close()
+
+	clientOCB, err := NewOCB(srv.key)
+	if err != nil {
+		t.Fatal(err)
+	}
+	clientTransport := NewTransport(clientOCB, false)
+	clientTransport.ForceNextSend()
+	for _, dg := range clientTransport.Tick() {
+		if _, err := legit.Write(dg); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	deadline := time.Now().Add(time.Second)
+	var established *net.UDPAddr
+	for time.Now().Before(deadline) {
+		srv.mu.Lock()
+		if srv.clientAddr != nil {
+			established = &net.UDPAddr{IP: append(net.IP(nil), srv.clientAddr.IP...), Port: srv.clientAddr.Port}
+		}
+		srv.mu.Unlock()
+		if established != nil {
+			break
+		}
+		time.Sleep(time.Millisecond)
+	}
+	if established == nil {
+		t.Fatal("authenticated heartbeat did not establish client address")
+	}
+
+	attacker, err := net.DialUDP("udp4", nil, serverAddr)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer attacker.Close()
+	forged := make([]byte, minDatagram+8)
+	if _, err := attacker.Write(forged); err != nil {
+		t.Fatal(err)
+	}
+	time.Sleep(20 * time.Millisecond)
+
+	srv.mu.Lock()
+	after := srv.clientAddr
+	srv.mu.Unlock()
+	if after == nil || after.Port != established.Port || !after.IP.Equal(established.IP) {
+		t.Fatalf("unauthenticated packet moved clientAddr: before=%v after=%v", established, after)
+	}
+}
