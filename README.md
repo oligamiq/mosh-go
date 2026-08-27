@@ -54,12 +54,25 @@ srv, _ := mosh.NewServer("/bin/bash", 60000, 60999)
 go srv.Serve()
 fmt.Println(srv.ConnectLine())
 
-// Client
+// Raw client protocol output
 c, _ := mosh.Dial("192.168.1.5", 60001, "base64key")
 c.Resize(80, 24)
 c.Send([]byte("ls\n"))
 out := c.Recv(time.Second)
 ```
+
+For an embedded xterm-compatible terminal view, use `DialTerminal` (or
+`DialConnTerminal` with a custom datagram transport). It adds the local display
+envelope that the reference `mosh-client` owns rather than `mosh-server`:
+
+```go
+c, _ := mosh.DialTerminal("192.168.1.5", 60001, "base64key")
+// The first Recv begins with alternate-screen + application-cursor setup.
+out := c.Recv(time.Second)
+```
+
+`Dial` and `DialConn` remain raw/backward-compatible. Embedded clients that
+manage terminal teardown themselves can use `XTermTerminalCloseSequence`.
 
 ## Embedding
 

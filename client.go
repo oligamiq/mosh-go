@@ -16,17 +16,18 @@ type Client struct {
 	transport *Transport
 	ocb       *OCB
 
-	mu      sync.Mutex
-	output  []byte // accumulated terminal output
-	outputC chan struct{}
+	mu                   sync.Mutex
+	output               []byte // accumulated terminal output
+	outputC              chan struct{}
+	terminalPresentation bool
 
 	// Action tracking for cumulative diffs.
 	actionsMu        sync.Mutex
 	actions          []UserInstruction
-	ackedActionCount int                // how many actions the server has
+	ackedActionCount int // how many actions the server has
 	lastAcked        uint64
-	sentActionCounts map[uint64]int     // sentNum → action count at that state
-	dirty            bool               // true = new actions since last tick
+	sentActionCounts map[uint64]int // sentNum → action count at that state
+	dirty            bool           // true = new actions since last tick
 
 	done chan struct{}
 	wg   sync.WaitGroup
@@ -35,7 +36,16 @@ type Client struct {
 // Dial connects to a mosh server over UDP. The key is the base64-encoded
 // mosh key (with or without padding).
 func Dial(host string, port int, key string) (*Client, error) {
-	// Pad key for base64 if needed.
+	return dial(host, port, key, false)
+}
+
+// DialTerminal connects to a mosh server and prepares an xterm-compatible local
+// terminal the same way the upstream mosh frontend does.
+func DialTerminal(host string, port int, key string) (*Client, error) {
+	return dial(host, port, key, true)
+}
+
+func dial(host string, port int, key string, terminalPresentation bool) (*Client, error) {
 	for len(key)%4 != 0 {
 		key += "="
 	}
@@ -43,20 +53,17 @@ func Dial(host string, port int, key string) (*Client, error) {
 	if err != nil {
 		return nil, fmt.Errorf("mosh: bad key: %w", err)
 	}
-
 	ocb, err := NewOCB(rawKey)
 	if err != nil {
 		return nil, err
 	}
-
-	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{
-		IP:   net.ParseIP(host),
-		Port: port,
-	})
+	conn, err := net.DialUDP("udp4", nil, &net.UDPAddr{IP: net.ParseIP(host), Port: port})
 	if err != nil {
 		return nil, err
 	}
-
+	if terminalPresentation {
+		return DialConnTerminal(conn, ocb)
+	}
 	return DialConn(conn, ocb)
 }
 
@@ -81,6 +88,35 @@ func DialConn(conn Conn, ocb *OCB) (*Client, error) {
 	c.tick()
 
 	return c, nil
+}
+
+// DialConnTerminal is DialConn plus the local-terminal presentation envelope
+// used by the upstream mosh frontend. This is intended for embedded terminal
+// emulators such as TailSSH's Termux TerminalView.
+func DialConnTerminal(conn Conn, ocb *OCB) (*Client, error) {
+	c, err := DialConn(conn, ocb)
+	if err != nil {
+		return nil, err
+	}
+	c.EnableXTermTerminalPresentation()
+	return c, nil
+}
+
+// EnableXTermTerminalPresentation prepends mosh's local display setup before
+// any server output. It is safe to call more than once.
+func (c *Client) EnableXTermTerminalPresentation() {
+	c.mu.Lock()
+	if c.terminalPresentation {
+		c.mu.Unlock()
+		return
+	}
+	c.terminalPresentation = true
+	c.output = append(XTermTerminalOpenSequence(), c.output...)
+	c.mu.Unlock()
+	select {
+	case c.outputC <- struct{}{}:
+	default:
+	}
 }
 
 // DialConnManual creates a mosh client without an internal sendLoop.
@@ -163,7 +199,6 @@ func (c *Client) Resize(cols, rows uint16) {
 	c.dirty = true
 	c.actionsMu.Unlock()
 }
-
 
 // Recv reads accumulated terminal output, blocking until output is available
 // or the timeout expires. Returns nil on timeout.
