@@ -15,8 +15,9 @@ import (
 	"sync/atomic"
 	"time"
 
-	"github.com/unixshells/vt-go"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/creack/pty"
+	"github.com/unixshells/vt-go"
 )
 
 const (
@@ -50,17 +51,19 @@ type Server struct {
 	transport *Transport
 
 	// VT emulator and framebuffer state for CUP-based diffing.
-	emu        *vt.Emulator
-	baseFB     *Framebuffer // what client has (last-acked)
-	sentFB     *Framebuffer // what we last sent (pending ack)
-	curVisible atomic.Bool
+	emu                   *vt.Emulator
+	baseFB                *Framebuffer // what client has (last-acked)
+	sentFB                *Framebuffer // what we last sent (pending ack)
+	curVisible            atomic.Bool
+	applicationCursorKeys atomic.Bool
 
 	// Remote client address — set on first received datagram.
 	mu         sync.Mutex
 	clientAddr *net.UDPAddr
 
-	started chan struct{} // closed when PTY is running
-	done    chan struct{}
+	started  chan struct{} // closed when PTY is running
+	done     chan struct{}
+	doneOnce sync.Once
 }
 
 // GenerateKey creates a random 128-bit mosh key and returns it as base64.
@@ -150,12 +153,7 @@ func (s *Server) Serve() error {
 		Cols: uint16(s.cols),
 	})
 
-	s.emu = vt.NewEmulator(s.cols, s.rows)
-	s.curVisible.Store(true)
-	s.emu.SetCallbacks(vt.Callbacks{
-		CursorVisibility: func(visible bool) { s.curVisible.Store(visible) },
-	})
-	s.baseFB = NewFramebuffer(s.cols, s.rows)
+	s.initializeEmulator()
 
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -181,7 +179,7 @@ func (s *Server) Serve() error {
 	}()
 
 	err = s.cmd.Wait()
-	close(s.done)
+	s.signalDone()
 	s.ptmx.Close()
 	s.conn.Close()
 	wg.Wait()
@@ -193,18 +191,37 @@ func (s *Server) Done() <-chan struct{} {
 	return s.done
 }
 
+func (s *Server) signalDone() {
+	s.doneOnce.Do(func() { close(s.done) })
+}
+
+func (s *Server) initializeEmulator() {
+	s.emu = vt.NewEmulator(s.cols, s.rows)
+	s.curVisible.Store(true)
+	s.applicationCursorKeys.Store(false)
+	s.emu.SetCallbacks(vt.Callbacks{
+		CursorVisibility: func(visible bool) { s.curVisible.Store(visible) },
+		EnableMode: func(mode ansi.Mode) {
+			if mode == ansi.ModeCursorKeys {
+				s.applicationCursorKeys.Store(true)
+			}
+		},
+		DisableMode: func(mode ansi.Mode) {
+			if mode == ansi.ModeCursorKeys {
+				s.applicationCursorKeys.Store(false)
+			}
+		},
+	})
+	s.baseFB = NewFramebuffer(s.cols, s.rows)
+}
+
 // ServeRW runs the event loop using an external io.ReadWriteCloser instead
 // of spawning a shell in a PTY. The caller provides terminal I/O through rw
 // and a resize callback. When rw is closed or reaches EOF, the server shuts down.
 func (s *Server) ServeRW(rw io.ReadWriteCloser, resize func(cols, rows uint16)) error {
 	close(s.started)
 
-	s.emu = vt.NewEmulator(s.cols, s.rows)
-	s.curVisible.Store(true)
-	s.emu.SetCallbacks(vt.Callbacks{
-		CursorVisibility: func(visible bool) { s.curVisible.Store(visible) },
-	})
-	s.baseFB = NewFramebuffer(s.cols, s.rows)
+	s.initializeEmulator()
 
 	var wg sync.WaitGroup
 	wg.Add(3)
@@ -250,7 +267,7 @@ func (s *Server) readIO(r io.Reader, out chan<- []byte) {
 			select {
 			case <-s.done:
 			default:
-				close(s.done)
+				s.signalDone()
 			}
 			return
 		}
@@ -272,7 +289,7 @@ func (s *Server) mainLoopRW(rw io.Writer, resize func(cols, rows uint16), ioOutp
 		case <-s.done:
 			return
 		case <-deadline:
-			close(s.done)
+			s.signalDone()
 			return
 		case <-time.After(100 * time.Millisecond):
 		}
@@ -282,6 +299,7 @@ func (s *Server) mainLoopRW(rw io.Writer, resize func(cols, rows uint16), ioOutp
 	defer ticker.Stop()
 
 	dirty := false
+	var inputTranslator userInputTranslator
 
 	for {
 		select {
@@ -297,7 +315,10 @@ func (s *Server) mainLoopRW(rw io.Writer, resize func(cols, rows uint16), ioOutp
 
 		case ui := <-userInput:
 			if len(ui.Keys) > 0 {
-				rw.Write(ui.Keys)
+				keys := inputTranslator.translate(ui.Keys, s.applicationCursorKeys.Load())
+				if len(keys) > 0 {
+					rw.Write(keys)
+				}
 			}
 			if ui.Width > 0 && ui.Height > 0 {
 				s.mu.Lock()
@@ -345,12 +366,14 @@ func (s *Server) Close() {
 	case <-s.started:
 		// PTY is running — kill it.
 	default:
-		// Serve() never called. Close socket and unblock any future Serve().
+		// Serve() never called. Mark it done and close the socket.
+		s.signalDone()
 		s.conn.Close()
 		return
 	}
 
-	if s.cmd.Process != nil {
+	s.signalDone()
+	if s.cmd != nil && s.cmd.Process != nil {
 		s.cmd.Process.Kill()
 	}
 	s.conn.Close()
@@ -377,7 +400,7 @@ func (s *Server) mainLoop(ptyOutput <-chan []byte, userInput <-chan UserInstruct
 		case <-s.done:
 			return
 		case <-deadline:
-			close(s.done)
+			s.signalDone()
 			return
 		case <-time.After(100 * time.Millisecond):
 		}
@@ -387,6 +410,7 @@ func (s *Server) mainLoop(ptyOutput <-chan []byte, userInput <-chan UserInstruct
 	defer ticker.Stop()
 
 	dirty := false
+	var inputTranslator userInputTranslator
 
 	for {
 		select {
@@ -402,7 +426,10 @@ func (s *Server) mainLoop(ptyOutput <-chan []byte, userInput <-chan UserInstruct
 
 		case ui := <-userInput:
 			if len(ui.Keys) > 0 {
-				s.ptmx.Write(ui.Keys)
+				keys := inputTranslator.translate(ui.Keys, s.applicationCursorKeys.Load())
+				if len(keys) > 0 {
+					s.ptmx.Write(keys)
+				}
 			}
 			if ui.Width > 0 && ui.Height > 0 {
 				s.mu.Lock()
